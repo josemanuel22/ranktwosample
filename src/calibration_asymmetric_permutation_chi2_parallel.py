@@ -1,20 +1,27 @@
 #!/usr/bin/env python3
 # -------------------------------------------------------------------
 # Parallel fast role-swapping (non-symmetric) χ² two-sample test
-#  • Outer repetitions (R) parallelized with ProcessPoolExecutor
+#  • R repetitions parallelized with ProcessPoolExecutor
 #  • Clean RNG splitting via numpy.random.SeedSequence.spawn(R)
 #  • Observed: ref = subset of Y (size K_ref); targets = X (size N)
-#  • Permutation: pick Y-pool of size K from pooled Z; targets=complement;
-#                 ref = subset of that permuted Y (size K_ref)
+#  • Permutation pools:
+#       (default) subset sampling Iy_pool ~ Unif(K-subsets of {0..n_tot-1})
+#       (--antithetic) paired pools from a permutation π and its reverse π^R:
+#           Iy_pool1 = π[:K], Ix_pool1 = π[K:]
+#           Iy_pool2 = π^R[:K], Ix_pool2 = π^R[K:]
 #  • Rank engines:
 #       - searchsorted : O(d · (K_ref log K_ref + m log K_ref)) per perm
 #       - prefixsum    : one cumsum per dim per perm (good when K_ref large)
 #       - auto         : choose by K_ref threshold (kref_switch)
-#  • Optional coarsening L1×…×Ld, Jeffreys smoothing α0, mid-p/randomized
-#  • Reports empirical type-I under H0 (α-hat + SE) and timing
-#  • Requires: numpy>=1.20, tqdm
+#  • Coarsening L1×…×Ld (auto or explicit), Jeffreys smoothing α0
+#  • Early stopping on permutation tail prob with CI:
+#       --stop_ci {hoeffding,wilson} (Wilson usually tighter), --delta, --min_b_check
+#  • NEW:
+#       --chunk <int>     : batch perms to reduce Python overhead
+#       --antithetic      : paired (π, π^R) perms for variance reduction
+#  • Reports type-I under H0, timing, avg perms used
 # -------------------------------------------------------------------
-import argparse, os, time
+import argparse, os, time, math
 from concurrent.futures import ProcessPoolExecutor
 import numpy as np
 from tqdm.auto import tqdm
@@ -45,15 +52,8 @@ def draw_null(mode, d, n, rng, rho=0.5, nu=5):
         raise ValueError(mode)
 
 
-# --------- Precompute global orders and tie-run maps (once per rep) ---------
+# --------- Precompute orders for prefix-sum ranks ---------
 def precompute_orders(Z, tie="right", jitter_scale=1e-12, rng=None):
-    """
-    For each dim j:
-      order_j: argsort of Z[:, j]
-      pos_j[i]: position of i in order_j
-      last_right_j[pos] / first_left_j[pos]: end/start of equal-run at pos
-    Used by prefix-sum engine. If tie='jitter', sort jittered Z.
-    """
     n_tot, d = Z.shape
     if tie == "jitter":
         if rng is None: rng = np.random.default_rng(0)
@@ -61,7 +61,7 @@ def precompute_orders(Z, tie="right", jitter_scale=1e-12, rng=None):
         side = "right"
     else:
         Zw = Z
-        side = tie  # 'right' or 'left'
+        side = tie
 
     orders, pos_all, last_right_all, first_left_all = [], [], [], []
     for j in range(d):
@@ -95,11 +95,6 @@ def precompute_orders(Z, tie="right", jitter_scale=1e-12, rng=None):
 
 # ---------------- Coarsening helpers ----------------
 def coarse_linear_index(m, K_ref, L_vec, w_coarse):
-    """
-    m: (#points, d) ranks in {0..K_ref}
-    If L_vec is None -> fine-grid linear index.
-    Else mc = floor(m * L / (K_ref+1)) -> linear with w_coarse.
-    """
     d = m.shape[1]
     if L_vec is None:
         base = K_ref + 1
@@ -111,9 +106,6 @@ def coarse_linear_index(m, K_ref, L_vec, w_coarse):
     return (mc * w_coarse).sum(axis=1)
 
 def choose_L_auto(d, K_ref, N_targets, target_exp=5):
-    """
-    Choose L_j so M = ∏ L_j ≈ N_targets / target_exp, each L_j ≤ K_ref+1.
-    """
     base = K_ref + 1
     M_goal = max(1, int(N_targets // max(1, target_exp)))
     if M_goal >= base ** d:
@@ -143,9 +135,6 @@ def pearson_asym_from_counts(HX, HY, N_local, Kref_local, alpha0_local=0.0):
 
 # ---------------- Rank engines ----------------
 def ranks_prefixsum(indices, sel_mask, ords, side_pick):
-    """
-    Prefix-sum engine: O(d * n_tot) for S per perm, then O(d * |indices|) queries.
-    """
     d = len(ords["orders"])
     m_cols = []
     for j in range(d):
@@ -160,10 +149,6 @@ def ranks_prefixsum(indices, sel_mask, ords, side_pick):
     return np.stack(m_cols, axis=1)
 
 def ranks_searchsorted(indices, Iref, Z_cols, side="right", jitter=None):
-    """
-    Searchsorted engine: O(d * (K_ref log K_ref + (|indices|) log K_ref)).
-    If jitter provided (shape (d, n_tot)), add to Z_cols to break ties.
-    """
     d = len(Z_cols)
     m_cols = []
     for j in range(d):
@@ -177,14 +162,63 @@ def ranks_searchsorted(indices, Iref, Z_cols, side="right", jitter=None):
     return np.stack(m_cols, axis=1)
 
 
+# ---------------- Early-stopping CI helpers ----------------
+def hoeffding_ci(k, n, delta):
+    if n <= 0: return 0.0, 1.0
+    phat = k / n
+    r = math.sqrt(max(0.0, math.log(2.0 / max(1e-16, delta))) / (2.0 * n))
+    return max(0.0, phat - r), min(1.0, phat + r)
+
+def _ndtri(p):
+    if p <= 0.0: return -1e300
+    if p >= 1.0: return 1e300
+    a = [ -39.6968302866538, 220.946098424521, -275.928510446969,
+          138.357751867269, -30.6647980661472, 2.50662827745924 ]
+    b = [ -54.4760987982241, 161.585836858041, -155.698979859887,
+           66.8013118877197, -13.2806815528857 ]
+    c = [ -0.00778489400243029, -0.322396458041136, -2.40075827716184,
+          -2.54973253934373, 4.37466414146497, 2.93816398269878 ]
+    d = [ 0.00778469570904146, 0.32246712907004, 2.445134137143,
+          3.75440866190742 ]
+    plow  = 0.02425
+    phigh = 1 - plow
+    if p < plow:
+        q = math.sqrt(-2*math.log(p))
+        return (((((c[0]*q+c[1])*q+c[2])*q+c[3])*q+c[4])*q+c[5]) / \
+               ((((d[0]*q+d[1])*q+d[2])*q+d[3])*q+1)
+    if p > phigh:
+        q = math.sqrt(-2*math.log(1-p))
+        return -(((((c[0]*q+c[1])*q+c[2])*q+c[3])*q+c[4])*q+c[5]) / \
+                 ((((d[0]*q+d[1])*q+d[2])*q+d[3])*q+1)
+    q = p - 0.5
+    r = q*q
+    return (((((a[0]*r+a[1])*r+a[2])*r+a[3])*r+a[4])*r+a[5])*q / \
+           (((((b[0]*r+b[1])*r+b[2])*r+b[3])*r+b[4])*r+1)
+
+def wilson_ci(k, n, delta):
+    if n <= 0: return 0.0, 1.0
+    z = _ndtri(1 - delta/2.0)
+    phat = k / n
+    denom = 1 + (z*z)/n
+    center = (phat + (z*z)/(2*n)) / denom
+    half = (z / denom) * math.sqrt(max(0.0, phat*(1-phat)/n + (z*z)/(4*n*n)))
+    lo = max(0.0, center - half)
+    hi = min(1.0, center + half)
+    return lo, hi
+
+
 # ----------- One repetition (worker) -----------
 def roleswap_fast_once(
     X, Y, B, alpha, K_ref, tie, alpha0, L_coarse, target_exp,
-    rng, jitter_scale, engine, kref_switch, decision
+    rng, jitter_scale, engine, kref_switch, decision,
+    stop_ci, delta, min_b_check, chunk, antithetic
 ):
     """
-    One repetition of role-swapping fast non-symmetric test.
-    Returns (reject:int, elapsed_ms:float).
+    One repetition with:
+      • Optional antithetic paired permutations (π, π^R)
+      • Early stopping via Wilson/Hoeffding CI
+      • Chunked inner loop
+    Returns (reject:int, elapsed_ms:float, perms_used:int).
     """
     t0 = time.perf_counter()
     N, d = X.shape
@@ -197,6 +231,9 @@ def roleswap_fast_once(
     # Pooled data
     Z = np.vstack([X, Y])
     Z_cols = [Z[:, j] for j in range(d)]
+    all_idx = np.arange(n_tot, dtype=np.int64)
+    mask = np.zeros(n_tot, dtype=bool)
+    sel  = np.zeros(n_tot, dtype=np.uint8)
 
     # Jitter arrays for searchsorted if tie='jitter'
     jitter = None
@@ -244,9 +281,9 @@ def roleswap_fast_once(
         mX_obs = ranks_searchsorted(idx_X_obs, Iy_obs, Z_cols, side=ss_side, jitter=jitter)
         mY_obs = ranks_searchsorted(Iy_obs,     Iy_obs, Z_cols, side=ss_side, jitter=jitter)
     else:
-        sel_obs = np.zeros(n_tot, dtype=np.uint8); sel_obs[Iy_obs] = 1
-        mX_obs = ranks_prefixsum(idx_X_obs, sel_obs, ords, side_pick)
-        mY_obs = ranks_prefixsum(Iy_obs,     sel_obs, ords, side_pick)
+        sel[:] = 0; sel[Iy_obs] = 1
+        mX_obs = ranks_prefixsum(idx_X_obs, sel, ords, side_pick)
+        mY_obs = ranks_prefixsum(Iy_obs,     sel, ords, side_pick)
 
     idx_lin_X = coarse_linear_index(mX_obs, K_ref, L, w_coarse)
     idx_lin_Y = coarse_linear_index(mY_obs, K_ref, L, w_coarse)
@@ -254,58 +291,185 @@ def roleswap_fast_once(
     HY_obs = np.bincount(idx_lin_Y, minlength=M_eff)
     T_obs  = pearson_asym_from_counts(HX_obs, HY_obs, N_local=N, Kref_local=K_ref, alpha0_local=alpha0)
 
-    # --------------- Permutations ---------------
-    T_perm = np.empty(B, dtype=float)
-    for b in range(B):
-        perm = rng.permutation(n_tot)
-        Iy_pool = perm[:K]                    # permuted Y pool
-        Ix_pool = perm[K:]                    # permuted targets
-        Iref    = rng.choice(Iy_pool, size=K_ref, replace=False)
+    # --------------- Permutations (chunked, optional antithetic) ---------------
+    ge = gt = eq = 0
+    perms_used = 0
+    allow_early = (decision in ("pvalue", "midp", "randomized"))
+    C = max(1, int(chunk))
+    b = 0
 
-        if use_searchsorted:
-            mX = ranks_searchsorted(Ix_pool, Iref, Z_cols, side=ss_side, jitter=jitter)
-            mY = ranks_searchsorted(Iref,    Iref, Z_cols, side=ss_side, jitter=jitter)
+    while b < B:
+        n_this = min(C, B - b)
+
+        # If antithetic: we will process in PAIRS; adjust local budget.
+        if antithetic:
+            # pairs to do this chunk
+            pairs = n_this // 2
+            # if odd remainder and total budget allows, we’ll do one extra single
+            remainder = n_this % 2
+            for _ in range(pairs):
+                # One base permutation and its reverse
+                perm = rng.permutation(n_tot)
+                permR = perm[::-1]
+
+                # Choose same positions inside the pool for Iref, mirrored for anti-correlation
+                ref_pos = rng.choice(K, size=K_ref, replace=False)
+                ref_posR = K - 1 - ref_pos  # mirror positions
+
+                # --- First (π) ---
+                Iy_pool = perm[:K]
+                Ix_pool = perm[K:]
+                Iref = Iy_pool[ref_pos]
+
+                if use_searchsorted:
+                    mX = ranks_searchsorted(Ix_pool, Iref, Z_cols, side=ss_side, jitter=jitter)
+                    mY = ranks_searchsorted(Iref,    Iref, Z_cols, side=ss_side, jitter=jitter)
+                else:
+                    sel[:] = 0; sel[Iref] = 1
+                    mX = ranks_prefixsum(Ix_pool, sel, ords, side_pick)
+                    mY = ranks_prefixsum(Iref,    sel, ords, side_pick)
+
+                idxX = coarse_linear_index(mX, K_ref, L, w_coarse)
+                idxY = coarse_linear_index(mY, K_ref, L, w_coarse)
+                HX = np.bincount(idxX, minlength=M_eff)
+                HY = np.bincount(idxY, minlength=M_eff)
+                T_b = pearson_asym_from_counts(HX, HY, N_local=N, Kref_local=K_ref, alpha0_local=alpha0)
+                if T_b > T_obs: gt += 1
+                elif T_b == T_obs: eq += 1
+                ge = gt + eq
+                b += 1; perms_used = b
+
+                # --- Second (π^R) ---
+                if b >= B: break
+                Iy_pool = permR[:K]
+                Ix_pool = permR[K:]
+                Iref = Iy_pool[ref_posR]
+
+                if use_searchsorted:
+                    mX = ranks_searchsorted(Ix_pool, Iref, Z_cols, side=ss_side, jitter=jitter)
+                    mY = ranks_searchsorted(Iref,    Iref, Z_cols, side=ss_side, jitter=jitter)
+                else:
+                    sel[:] = 0; sel[Iref] = 1
+                    mX = ranks_prefixsum(Ix_pool, sel, ords, side_pick)
+                    mY = ranks_prefixsum(Iref,    sel, ords, side_pick)
+
+                idxX = coarse_linear_index(mX, K_ref, L, w_coarse)
+                idxY = coarse_linear_index(mY, K_ref, L, w_coarse)
+                HX = np.bincount(idxX, minlength=M_eff)
+                HY = np.bincount(idxY, minlength=M_eff)
+                T_b = pearson_asym_from_counts(HX, HY, N_local=N, Kref_local=K_ref, alpha0_local=alpha0)
+                if T_b > T_obs: gt += 1
+                elif T_b == T_obs: eq += 1
+                ge = gt + eq
+                b += 1; perms_used = b
+
+                # early-stop after the pair
+                if allow_early and b >= min_b_check:
+                    lo, hi = (wilson_ci(ge, b, delta) if stop_ci == "wilson"
+                              else hoeffding_ci(ge, b, delta))
+                    if hi <= alpha or lo > alpha:
+                        break
+
+            if allow_early and b >= min_b_check:
+                if (stop_ci == "wilson" and (wilson_ci(ge, b, delta)[1] <= alpha or wilson_ci(ge, b, delta)[0] > alpha)) \
+                   or (stop_ci == "hoeffding" and (hoeffding_ci(ge, b, delta)[1] <= alpha or hoeffding_ci(ge, b, delta)[0] > alpha)):
+                    break
+
+            # If an odd one remains in this chunk and budget allows, do a single subset sample
+            if remainder and b < B:
+                Iy_pool = rng.choice(n_tot, size=K, replace=False)
+                mask[:] = False; mask[Iy_pool] = True
+                Ix_pool = all_idx[~mask]
+                Iref = rng.choice(Iy_pool, size=K_ref, replace=False)
+
+                if use_searchsorted:
+                    mX = ranks_searchsorted(Ix_pool, Iref, Z_cols, side=ss_side, jitter=jitter)
+                    mY = ranks_searchsorted(Iref,    Iref, Z_cols, side=ss_side, jitter=jitter)
+                else:
+                    sel[:] = 0; sel[Iref] = 1
+                    mX = ranks_prefixsum(Ix_pool, sel, ords, side_pick)
+                    mY = ranks_prefixsum(Iref,    sel, ords, side_pick)
+
+                idxX = coarse_linear_index(mX, K_ref, L, w_coarse)
+                idxY = coarse_linear_index(mY, K_ref, L, w_coarse)
+                HX = np.bincount(idxX, minlength=M_eff)
+                HY = np.bincount(idxY, minlength=M_eff)
+                T_b = pearson_asym_from_counts(HX, HY, N_local=N, Kref_local=K_ref, alpha0_local=alpha0)
+                if T_b > T_obs: gt += 1
+                elif T_b == T_obs: eq += 1
+                ge = gt + eq
+                b += 1; perms_used = b
+
+                if allow_early and b >= min_b_check:
+                    lo, hi = (wilson_ci(ge, b, delta) if stop_ci == "wilson"
+                              else hoeffding_ci(ge, b, delta))
+                    if hi <= alpha or lo > alpha:
+                        break
+
         else:
-            sel = np.zeros(n_tot, dtype=np.uint8); sel[Iref] = 1
-            mX = ranks_prefixsum(Ix_pool, sel, ords, side_pick)
-            mY = ranks_prefixsum(Iref,    sel, ords, side_pick)
+            # Standard subset-sample path (no antithetic)
+            for _ in range(n_this):
+                Iy_pool = rng.choice(n_tot, size=K, replace=False)
+                mask[:] = False; mask[Iy_pool] = True
+                Ix_pool = all_idx[~mask]
+                Iref    = rng.choice(Iy_pool, size=K_ref, replace=False)
 
-        idxX = coarse_linear_index(mX, K_ref, L, w_coarse)
-        idxY = coarse_linear_index(mY, K_ref, L, w_coarse)
-        HX = np.bincount(idxX, minlength=M_eff)
-        HY = np.bincount(idxY, minlength=M_eff)
-        T_perm[b] = pearson_asym_from_counts(HX, HY, N_local=N, Kref_local=K_ref, alpha0_local=alpha0)
+                if use_searchsorted:
+                    mX = ranks_searchsorted(Ix_pool, Iref, Z_cols, side=ss_side, jitter=jitter)
+                    mY = ranks_searchsorted(Iref,    Iref, Z_cols, side=ss_side, jitter=jitter)
+                else:
+                    sel[:] = 0; sel[Iref] = 1
+                    mX = ranks_prefixsum(Ix_pool, sel, ords, side_pick)
+                    mY = ranks_prefixsum(Iref,    sel, ords, side_pick)
 
-    ge = int((T_perm >= T_obs).sum())
-    gt = int((T_perm >  T_obs).sum())
-    eq = ge - gt
+                idxX = coarse_linear_index(mX, K_ref, L, w_coarse)
+                idxY = coarse_linear_index(mY, K_ref, L, w_coarse)
+                HX = np.bincount(idxX, minlength=M_eff)
+                HY = np.bincount(idxY, minlength=M_eff)
+                T_b = pearson_asym_from_counts(HX, HY, N_local=N, Kref_local=K_ref, alpha0_local=alpha0)
+
+                if T_b > T_obs: gt += 1
+                elif T_b == T_obs: eq += 1
+                ge = gt + eq
+                b += 1; perms_used = b
+
+                if allow_early and b >= min_b_check:
+                    lo, hi = (wilson_ci(ge, b, delta) if stop_ci == "wilson"
+                              else hoeffding_ci(ge, b, delta))
+                    if hi <= alpha or lo > alpha:
+                        break
+
+        if allow_early and b >= min_b_check:
+            lo, hi = (wilson_ci(ge, b, delta) if stop_ci == "wilson"
+                      else hoeffding_ci(ge, b, delta))
+            if hi <= alpha or lo > alpha:
+                break
+
+    # final p-values using actually-used permutations
+    b = max(1, perms_used)
+    p_perm = (1 + ge) / (b + 1)
+    p_mid  = (gt + 0.5 * eq) / b
 
     # decision
-    p_perm = (1 + ge) / (B + 1)
-    p_mid  = (gt + 0.5 * eq) / B if B > 0 else 1.0
-
     if decision == "pvalue":
         reject = (p_perm <= alpha)
     elif decision == "midp":
         reject = (p_mid <= alpha)
     elif decision == "randomized":
-        p_lower = (1 + gt) / (B + 1)
+        p_lower = (1 + gt) / (b + 1)
         if p_lower > alpha:
             reject = False
         elif eq == 0:
-            reject = True
+            reject = (p_perm <= alpha)
         else:
-            omega = (alpha - p_lower) / (eq / (B + 1))
+            omega = (alpha - p_lower) / (eq / (b + 1))
             omega = float(np.clip(omega, 0.0, 1.0))
             reject = (rng.random() <= omega)
     else:
-        # fallback: threshold on T_perm
-        k = max(0, min(B - 1, int(np.ceil((B + 1) * (1 - alpha))) - 1))
-        tau_alpha = float(np.partition(T_perm, k)[k])
-        reject = bool(T_obs >= tau_alpha)
+        reject = (p_perm <= alpha)
 
     elapsed_ms = 1e3 * (time.perf_counter() - t0)
-    return int(reject), float(elapsed_ms)
+    return int(reject), float(elapsed_ms), int(perms_used)
 
 
 # ---------------- Utilities ----------------
@@ -315,35 +479,33 @@ def se_binom(a_hat, R):
 
 # ---------------- Worker wrapper for executor ----------------
 def run_one_rep(seed_seq, setup):
-    """
-    Build rng from SeedSequence; draw X,Y; run one repetition; return (reject, ms)
-    """
     (mode, d, N, K, B, alpha, K_ref, tie, alpha0,
      L_coarse, target_exp, engine, kref_switch,
-     decision, rho, nu) = setup
+     decision, rho, nu, stop_ci, delta, min_b_check, chunk, antithetic) = setup
 
     rng = make_rng(seed_seq)
     X = draw_null(mode, d, N, rng, rho=rho, nu=nu)
     Y = draw_null(mode, d, K, rng, rho=rho, nu=nu)
 
-    r, ms = roleswap_fast_once(
+    r, ms, used = roleswap_fast_once(
         X, Y, B=B, alpha=alpha, K_ref=K_ref,
         tie=tie, alpha0=alpha0, L_coarse=L_coarse, target_exp=target_exp,
         rng=rng, jitter_scale=1e-12, engine=engine, kref_switch=kref_switch,
-        decision=decision
+        decision=decision, stop_ci=stop_ci, delta=delta, min_b_check=min_b_check,
+        chunk=chunk, antithetic=antithetic
     )
-    return r, ms
+    return r, ms, used
 
 
 # ---------------- CLI driver ----------------
 def main():
-    ap = argparse.ArgumentParser(description="Parallel fast role-swapping χ² (non-symmetric)")
+    ap = argparse.ArgumentParser(description="Parallel fast role-swapping χ² (non-symmetric) | early-stop + chunking + antithetic")
     ap.add_argument("--mode", choices=["null-gauss", "null-copula", "null-studentt"], default="null-gauss")
     ap.add_argument("--d", type=int, default=4)
     ap.add_argument("--N", type=int, default=1000)
     ap.add_argument("--K", type=int, default=5)
     ap.add_argument("--K_ref", type=int, default=None, help="Reference size (subset of Y), default K")
-    ap.add_argument("--B", type=int, default=1000, help="Permutations per repetition")
+    ap.add_argument("--B", type=int, default=1000, help="Max permutations per repetition")
     ap.add_argument("--R", type=int, default=200, help="Outer repetitions under H0")
     ap.add_argument("--alpha", type=float, default=0.05)
     ap.add_argument("--alpha0", type=float, default=0.5, help="Jeffreys smoothing per cell")
@@ -354,21 +516,29 @@ def main():
 
     # Rank engine + coarsening
     ap.add_argument("--engine", choices=["auto","searchsorted","prefixsum"], default="auto")
-    ap.add_argument("--kref_switch", type=int, default=64, help="When engine=auto, use searchsorted if K_ref ≤ this")
+    ap.add_argument("--kref_switch", type=int, default=64)
     ap.add_argument("--L", type=str, default=None, help="Coarsen to L1,...,Ld (e.g. '3,3,3,3'); omit for auto")
-    ap.add_argument("--target_exp", type=int, default=5, help="Auto-coarsen target expected count per cell")
+    ap.add_argument("--target_exp", type=int, default=5)
 
     # Decision rule
     ap.add_argument("--decision", choices=["pvalue","midp","randomized","threshold"], default="randomized")
 
+    # Early stopping CI
+    ap.add_argument("--stop_ci", choices=["hoeffding","wilson"], default="wilson")
+    ap.add_argument("--delta", type=float, default=1e-2)
+    ap.add_argument("--min_b_check", type=int, default=100)
+
+    # Chunking and antithetics
+    ap.add_argument("--chunk", type=int, default=128, help="Permutations per batch")
+    ap.add_argument("--antithetic", action="store_true", help="Use antithetic permutation pairs (π, π^R)")
+
     # Parallelism
-    ap.add_argument("--jobs", type=int, default=None, help="Parallel workers over repetitions (default: os.cpu_count())")
+    ap.add_argument("--jobs", type=int, default=None)
     ap.add_argument("--single_thread_blas", action="store_true",
                     help="Set OMP/MKL threads=1 inside workers to avoid oversubscription")
 
     args = ap.parse_args()
 
-    # Optional: restrict BLAS threads to avoid oversubscription
     if args.single_thread_blas:
         os.environ["OMP_NUM_THREADS"] = "1"
         os.environ["MKL_NUM_THREADS"] = "1"
@@ -377,7 +547,6 @@ def main():
 
     rng = make_rng(args.seed)
 
-    # Parse L
     L_coarse = None
     if args.L:
         L_coarse = [int(x) for x in args.L.split(",") if x.strip() != ""]
@@ -389,49 +558,48 @@ def main():
           f"B={args.B}, R={args.R}, alpha={args.alpha}, tie={args.tie}, alpha0={args.alpha0}")
     print(f" decision={args.decision}, kref_switch={args.kref_switch}, target_exp={args.target_exp}, "
           f"L={(L_coarse if L_coarse is not None else 'auto')}, jobs={jobs}, seed={args.seed}")
+    print(f" early-stop: stop_ci={args.stop_ci}, delta={args.delta}, min_b_check={args.min_b_check}, "
+          f"chunk={args.chunk}, antithetic={args.antithetic}")
 
-    # Immutable setup for workers
     setup = (args.mode, args.d, args.N, args.K, args.B, args.alpha, args.K_ref, args.tie,
              args.alpha0, L_coarse, args.target_exp, args.engine, args.kref_switch,
-             args.decision, args.rho, args.nu)
+             args.decision, args.rho, args.nu, args.stop_ci, args.delta, args.min_b_check,
+             args.chunk, args.antithetic)
 
-    # Spawn independent seeds for each repetition
     ss = np.random.SeedSequence(args.seed)
-    rep_seeds = ss.spawn(args.R)  # list of SeedSequence objects
+    rep_seeds = ss.spawn(args.R)
 
-    rejects, times = [], []
+    rejects, times, used_list = [], [], []
     if jobs == 1:
-        # Serial (still nice to test correctness)
         with tqdm(total=args.R, desc="Total H0 repetitions", leave=True) as pbar:
             for s in rep_seeds:
-                r, ms = run_one_rep(s, setup)
-                rejects.append(r); times.append(ms)
+                r, ms, used = run_one_rep(s, setup)
+                rejects.append(r); times.append(ms); used_list.append(used)
                 pbar.update(1)
     else:
-        # Parallel over repetitions
         with ProcessPoolExecutor(max_workers=jobs) as ex:
-            # map preserves order; wrap with tqdm for one progress bar
             it = ex.map(run_one_rep, rep_seeds, (setup,)*args.R, chunksize=max(1, args.R // (jobs*4)))
             with tqdm(total=args.R, desc="Total H0 repetitions", leave=True) as pbar:
-                for r, ms in it:
-                    rejects.append(r); times.append(ms)
+                for r, ms, used in it:
+                    rejects.append(r); times.append(ms); used_list.append(used)
                     pbar.update(1)
 
-    # Summaries
     R = args.R
     a_hat = float(np.mean(rejects)) if R else 0.0
     se_hat = se_binom(a_hat, R) if R else 0.0
     avg_ms = float(np.mean(times)) if times else 0.0
+    avg_used = float(np.mean(used_list)) if used_list else 0.0
 
     print("\n[Empirical Type-I under H0]")
     print("---------------------------")
     print(f"α̂ (reject/total): {a_hat:.4f}   SE ≈ {se_hat:.4f}")
     print(f"Avg time per repetition: {avg_ms:8.2f} ms")
+    print(f"Avg permutations used (early-stop): {avg_used:8.1f} / B={args.B}")
     print("Notes:")
-    print(" • Parallelizes only the outer repetitions (R) to keep IPC light.")
-    print(" • Use --decision randomized for exact-α at tie boundaries; mid-p reduces conservativeness.")
-    print(" • Coarsen (auto via --target_exp or explicit --L) for stability/speed when d or K_ref grows.")
-    print(" • For best calibration under H0, prefer the symmetric counts-only MVHG variant when feasible.")
+    print(" • Antithetic pairs (π, π^R) reduce MC variance of the tail estimator.")
+    print(" • Chunking reduces Python overhead; Wilson CI usually stops earlier than Hoeffding.")
+    print(" • For exact-α at ties use --decision randomized; --tie jitter is recommended.")
+    print(" • Coarsen (auto or --L) to avoid ultra-sparse HY when d or K_ref grows.")
 
 if __name__ == "__main__":
     main()
