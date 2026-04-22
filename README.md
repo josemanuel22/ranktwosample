@@ -1,8 +1,3 @@
-Yes — here is a README draft you can paste into the repo.
-
-I based it on the current repository layout and file headers: the repo is Python-only, with core code in `src/ranktwosample`, benchmark scripts in `src/scripts`, and baseline methods in `src/baselines`. The core implementation centers on a non-symmetric rank (\chi^2)/G-test with permutation calibration, optional CuPy GPU support, and two reference modes (`shared_pool` and `fresh_iid`). The scripts include a general power/calibration benchmark runner, a subspace benchmark script, and a CIFAR-10 vs CIFAR-10-C experiment script. ([GitHub][1])
-
-````markdown
 # ranktwosample
 
 Rank-based two-sample testing code for permutation-calibrated multivariate goodness-of-fit and power experiments.
