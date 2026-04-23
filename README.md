@@ -245,6 +245,12 @@ This repository is currently organized primarily as a **research codebase**, not
 * GPU support is optional and relies on CuPy
 
 ---
+## License
 
+This repository's source code is released under the MIT License. See the `LICENSE` file.
 
+## Third-party assets
 
+- CIFAR-10: official dataset page: https://www.cs.toronto.edu/~kriz/cifar.html
+- CIFAR-10-C: CC BY 4.0, https://doi.org/10.5281/zenodo.2535967
+- hendrycks/robustness code repository: Apache-2.0
