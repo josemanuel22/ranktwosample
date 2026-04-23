@@ -2,7 +2,7 @@
 
 Rank-based two-sample testing code for permutation-calibrated multivariate goodness-of-fit and power experiments.
 
-This repository implements a **non-symmetric rank \(\chi^2\) / G-test** and a **subspace-sliced extension**, together with dataset generators and several baseline methods commonly used in two-sample testing benchmarks.
+This repository implements a **non-symmetric rank $\chi^2$ / G-test** and a **subspace-sliced extension**, together with dataset generators and several baseline methods commonly used in two-sample testing benchmarks.
 
 ## What is included
 
